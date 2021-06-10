@@ -2,8 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -13,7 +18,9 @@ import (
 	"github.com/accept-nano/accept-nano/internal/units"
 	"github.com/cenkalti/log"
 	"github.com/shopspring/decimal"
-	"go.etcd.io/bbolt"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var (
@@ -26,138 +33,202 @@ var notificationClient http.Client
 // Payment is the data type stored in the database in JSON format.
 type Payment struct {
 	// Customer sends money to this account.
-	account string
+	account string `bson:"account"`
 	// Index for generating deterministic key.
-	Index string `json:"index"`
+	Index string `json:"index" bson:"index"`
 	// Currency of amount in original request.
-	Currency string `json:"currency"`
+	Currency string `json:"currency" bson:"currency"`
 	// Original amount requested by client in preferred currency.
-	AmountInCurrency decimal.Decimal `json:"amountInCurrency"`
+	AmountInCurrency decimal.Decimal `json:"amountInCurrency" bson:"amountInCurrency"`
 	// Requested amount in raw.
 	// Calculated when payment request is created.
 	// Payment is fulfilled when Account contains at least this amount.
-	Amount decimal.Decimal `json:"amount"`
+	Amount decimal.Decimal `json:"amount" bson:"amount"`
 	// Current balance of Account in raw.
-	Balance decimal.Decimal `json:"balance"`
+	Balance decimal.Decimal `json:"balance" bson:"balance"`
 	// Individual transactions to pay the total amount.
-	SubPayments map[string]SubPayment `json:"subPayments"`
+	SubPayments map[string]SubPayment `json:"subPayments" bson:"subPayments"`
 	// Free text field to pass from customer to merchant.
-	State string `json:"state"`
+	State string `json:"state" bson:"state"`
 	// Set when customer created the payment request via API.
-	CreatedAt time.Time `json:"createdAt"`
+	CreatedAt time.Time `json:"createdAt" bson:"createdAt"`
 	// Set every time Account is checked for incoming funds.
-	LastCheckedAt *time.Time `json:"lastCheckedAt"`
+	LastCheckedAt *time.Time `json:"lastCheckedAt" bson:"lastCheckedAt"`
 	// Set when detected customer has sent enough funds to Account.
-	FulfilledAt *time.Time `json:"fulfilledAt"`
+	FulfilledAt *time.Time `json:"fulfilledAt" bson:"fulfilledAt"`
 	// Set when merchant is notified.
-	NotifiedAt *time.Time `json:"notifiedAt"`
+	NotifiedAt *time.Time `json:"notifiedAt" bson:"notifiedAt"`
 	// Set when pending funds are accepted to Account.
-	ReceivedAt *time.Time `json:"receivedAt"`
+	ReceivedAt *time.Time `json:"receivedAt" bson:"receivedAt"`
 	// Set when Amount is sent to the merchant account.
-	SentAt *time.Time `json:"sentAt"`
+	SentAt *time.Time `json:"sentAt" bson:"sentAt"`
 }
 
 type SubPayment struct {
 	// Amount in raw.
-	Amount decimal.Decimal `json:"amount"`
+	Amount decimal.Decimal `json:"amount" bson:"amount"`
 	// Sender account.
-	Account string `json:"account"`
+	Account string `json:"account" bson:"account"`
 }
 
 // LoadPayment fetches a Payment object from database by key.
 func LoadPayment(account string) (*Payment, error) {
-	var value []byte
-	err := db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(paymentsBucket))
-		v := b.Get([]byte(account))
-		if v == nil {
-			return nil
-		}
-		value = make([]byte, len(v))
-		copy(value, v)
-		return nil
-	})
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	payment := &Payment{account: account}
+	m := &bson.M{}
+	filter := bson.M{"account": account}
+	err := collection.FindOne(ctx, filter).Decode(m)
+	if err == mongo.ErrNoDocuments {
+		// Do something when no record was found
+		fmt.Println("record does not exist")
+		return nil, errPaymentNotFound
+	} else if err != nil {
+		log.Fatal(err)
 		return nil, err
 	}
-	if value == nil {
-		return nil, errPaymentNotFound
-	}
-	payment := &Payment{account: account}
-	err = json.Unmarshal(value, payment)
+	jsonBytes, err := json.Marshal(m)
+	json.Unmarshal(jsonBytes, &payment)
+
 	return payment, err
 }
 
 func LoadActivePayments() ([]*Payment, error) {
-	ret := make([]*Payment, 0)
-	err := db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(paymentsBucket))
-		return b.ForEach(func(k, v []byte) error {
-			p := &Payment{account: string(k)}
-			err := json.Unmarshal(v, p)
-			if err != nil {
-				log.Error(err)
-				return nil
-			}
-			if !p.finished() {
-				ret = append(ret, p)
-			}
-			return nil
-		})
-	})
-	return ret, err
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cursor, err := collection.Find(ctx, bson.M{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer cursor.Close(ctx)
+	var payments []*Payment
+	for cursor.Next(ctx) {
+		m := bson.M{}
+
+		if err = cursor.Decode(&m); err != nil {
+			log.Fatal(err)
+		}
+
+		jsonBytes, _ := json.Marshal(m)
+		payment := &Payment{account: m["account"].(string)}
+		json.Unmarshal(jsonBytes, &payment)
+		payments = append(payments, payment)
+	}
+
+	return payments, err
 }
 
 // Save the Payment object in database.
 func (p *Payment) Save() error {
-	value, err := json.Marshal(&p)
+	value, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	return db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(paymentsBucket))
-		return b.Put([]byte(p.account), value)
-	})
+	m := bson.M{}
+	json.Unmarshal(value, &m)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := collection.UpdateOne(
+		ctx,
+		bson.M{"account": p.account},
+		bson.M{
+			"$set": m,
+		},
+		options.Update().SetUpsert(true),
+	)
+	log.Debugln("Updated ", result.ModifiedCount, " Documents!\n")
+	return err
 }
 
 // SaveNew saves newly created payment. Sets account and index fields before saving.
 func (p *Payment) SaveNew() error {
-	return db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(paymentsBucket))
-		// Before using incremental ids, payment accounts were being generated with random indices.
-		// It is very unlikely that there are many payments with consecutive indices saved in database.
-		var index string
-		var account string
-		found := false
-		for i := 0; i < 100; i++ {
-			// This returns an error only if the Tx is closed or not writeable.
-			// That can't happen in an Update() call so I ignore the error check.
-			id, _ := b.NextSequence()
-			index = strconv.FormatUint(id, 10)
-			key, err := node.DeterministicKey(config.Seed, index)
-			if err != nil {
-				return err
-			}
-			v := b.Get([]byte(key.Account))
-			if v != nil {
-				// Payment exists with generated incremental index. Try next index.
-				continue
-			}
-			found = true
-			account = key.Account
-			break
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Before using incremental ids, payment accounts were being generated with random indices.
+	// It is very unlikely that there are many payments with consecutive indices saved in database.
+	var index string
+	var account string
+	found := false
+	for i := 0; i < 100; i++ {
+		// This returns an error only if the Tx is closed or not writeable.
+		// That can't happen in an Update() call so I ignore the error check.
+
+		sortCursor, err := collection.Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"index": -1}).SetLimit(1))
+		if err != nil {
+			log.Fatal(err)
+			return err
 		}
-		if !found {
-			return errors.New("internal error: cannot create unique index")
+
+		var paymentsSorted []bson.M
+		if err = sortCursor.All(ctx, &paymentsSorted); err != nil {
+			log.Fatal(err)
+			return err
 		}
-		p.Index = index
-		p.account = account
-		value, err := json.Marshal(&p)
+		var lastIndex string
+		if len(paymentsSorted) > 0 {
+			lastIndex = paymentsSorted[0]["index"].(string)
+		} else {
+			lastIndex = "0"
+		}
+		lastIndexInt, err := strconv.ParseInt(lastIndex, 10, 0)
+
+		if err != nil {
+			log.Fatal(err)
+			return err
+		}
+
+		id := (uint64(lastIndexInt) + 1)
+		index = strconv.FormatUint(id, 10)
+		key, err := node.DeterministicKey(config.Seed, index)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(p.account), value)
-	})
+
+		m := &bson.M{}
+		filter := bson.M{"account": key.Account}
+		err = collection.FindOne(ctx, filter).Decode(m)
+		if err == mongo.ErrNoDocuments {
+			// Payment not exists go to next steps
+		} else if err != nil {
+			log.Fatal(err)
+			return err
+		} else {
+			// Payment exists with generated incremental index. Try next index.
+			continue
+		}
+
+		found = true
+		account = key.Account
+		break
+	}
+	if !found {
+		return errors.New("internal error: cannot create unique index")
+	}
+	p.Index = index
+	p.account = account
+
+	value, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	m := bson.M{}
+	json.Unmarshal(value, &m)
+
+	result, err := collection.UpdateOne(
+		ctx,
+		bson.M{"account": p.account},
+		bson.M{
+			"$set": m,
+		},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		return err
+	}
+	log.Debugf("Updated %v Documents!\n", result.ModifiedCount)
+
+	return err
 }
 
 // NextCheck returns the next timestamp payment should be checked at.
@@ -193,6 +264,7 @@ func (p Payment) remainingDuration() time.Duration {
 
 // StartChecking starts a goroutine to check the payment periodically.
 func (p *Payment) StartChecking() {
+	log.Debugln(p.account)
 	if p.finished() {
 		return
 	}
@@ -429,6 +501,37 @@ func (p *Payment) notifyMerchant() error {
 	if err != nil {
 		return err
 	}
+
+	if config.WebhookSecret != "" {
+		req, err := http.NewRequest(http.MethodPost, config.NotificationURL, bytes.NewReader(data)) // nolint:noctx // client timeout set
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		// Create a new HMAC by defining the hash type and the key (as byte array)
+		h := hmac.New(sha256.New, []byte(config.WebhookSecret))
+		// Write Data to it
+		h.Write([]byte(data))
+		// Get result and encode as hexadecimal string
+		sha := hex.EncodeToString(h.Sum(nil))
+		req.Header.Set("x-webhook-signature", sha)
+
+		resp, err := notificationClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err2 := resp.Body.Close(); err2 != nil {
+				log.Debug(err2)
+			}
+		}()
+		if resp.StatusCode != http.StatusOK {
+			return errors.New("bad notification response")
+		}
+		return nil
+	}
+
 	resp, err := notificationClient.Post(config.NotificationURL, "application/json", bytes.NewReader(data)) // nolint:noctx // client timeout set
 	if err != nil {
 		return err

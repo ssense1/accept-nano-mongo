@@ -98,6 +98,15 @@ type Config struct {
 	CoinmarketcapRequestTimeout time.Duration
 	// Cache price value for a duration
 	CoinmarketcapCacheDuration time.Duration
+	// MongoDB Connection URI
+	MongoDBConnectURI string
+	// Payments DB Name
+	PaymentsDBName string
+	// Payments Collection Name
+	PaymentsCollectionName string
+	// Webhook Secret
+	// If this has value webhook will send x-webhook-signature header along with it
+	WebhookSecret string
 }
 
 var DefaultConfig = Config{

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/accept-nano/accept-nano/internal/hub"
 	"github.com/accept-nano/accept-nano/internal/nano"
@@ -17,10 +18,9 @@ import (
 	"github.com/cenkalti/log"
 	"github.com/ulule/limiter/v3"
 	"github.com/ulule/limiter/v3/drivers/store/memory"
-	"go.etcd.io/bbolt"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
-
-const paymentsBucket = "payments"
 
 // These variables are set by goreleaser on build.
 var (
@@ -34,7 +34,8 @@ var (
 	configPath        = flag.String("config", "config.toml", "config file path")
 	versionFlag       = flag.Bool("version", false, "display version and exit")
 	config            Config
-	db                *bbolt.DB
+	userclient        *mongo.Client
+	collection        *mongo.Collection
 	server            http.Server
 	rateLimiter       *limiter.Limiter
 	node              *nano.Node
@@ -51,6 +52,42 @@ func versionString() string {
 		commit = commit[:shaLen]
 	}
 	return fmt.Sprintf("%s (%s) [%s]", version, commit, date)
+}
+
+func ConnectMongoDB() (*mongo.Client, error) {
+
+	if config.MongoDBConnectURI == "" {
+		return nil, fmt.Errorf("no connection string provided in config")
+	}
+
+	log.Debugln("Connecting to DB")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// user Connection database
+
+	// Set client options
+	clientOptions := options.Client().ApplyURI(config.MongoDBConnectURI)
+
+	// Connect to MongoDB
+	userclient, err := mongo.Connect(ctx, clientOptions)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Check the connection
+	err = userclient.Ping(ctx, nil)
+
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debugln("Connected to user MongoDB!")
+
+	return userclient, err
+
 }
 
 func main() {
@@ -83,6 +120,13 @@ func main() {
 		log.Warning("empty CoinmarketcapAPIKey in config, fiat conversions will not work")
 	}
 
+	userclient, err = ConnectMongoDB()
+	if err != nil {
+		log.Fatalln("error:", err)
+		return
+	}
+	collection = userclient.Database(config.PaymentsDBName).Collection(config.PaymentsCollectionName)
+
 	rate, err := limiter.NewRateFromFormatted(config.RateLimit)
 	if err != nil {
 		log.Fatal(err)
@@ -93,26 +137,12 @@ func main() {
 	notificationClient.Timeout = config.NotificationRequestTimeout
 	priceAPI = price.NewAPI(config.CoinmarketcapAPIKey, config.CoinmarketcapRequestTimeout, config.CoinmarketcapCacheDuration)
 
-	log.Debugln("opening db:", config.DatabasePath)
-	db, err = bbolt.Open(config.DatabasePath, 0600, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Debugln("db has been opened successfully")
-
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, txErr := tx.CreateBucketIfNotExists([]byte(paymentsBucket))
-		return txErr
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	// Check existing payments.
 	payments, err := LoadActivePayments()
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Debugln("Existing payments:", len(payments))
 	for _, p := range payments {
 		p.StartChecking()
 	}
@@ -143,11 +173,6 @@ func main() {
 	}
 
 	checkPaymentWG.Wait()
-
-	err = db.Close()
-	if err != nil {
-		log.Fatal(err)
-	}
 }
 
 func runChecker() {
