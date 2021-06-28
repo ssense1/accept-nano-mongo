@@ -15,6 +15,23 @@ var (
 	workThresholdForRecv uint64 = 0xfffffe0000000000
 )
 
+func (n *Node) RemoteWork(hash string) (string, error) {
+	log.Debug("starting work")
+	args := map[string]interface{}{
+		"hash":      hash,
+		"use_peers": true,
+	}
+	var response struct {
+		Work string `json:"work"`
+	}
+	err := n.call("work_generate", args, &response)
+	if err != nil {
+		return "", err
+	}
+	log.Debug("work finished")
+	return response.Work, nil
+}
+
 func GenerateWork(hash string, forSend bool) (string, error) {
 	b, err := hex.DecodeString(hash)
 	if err != nil {

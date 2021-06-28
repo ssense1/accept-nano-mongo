@@ -107,6 +107,8 @@ type Config struct {
 	// Webhook Secret
 	// If this has value webhook will send x-webhook-signature header along with it
 	WebhookSecret string
+	// Work Node URL
+	WorkNodeURL string
 }
 
 var DefaultConfig = Config{

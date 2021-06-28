@@ -39,6 +39,7 @@ var (
 	server            http.Server
 	rateLimiter       *limiter.Limiter
 	node              *nano.Node
+	worknode          *nano.Node
 	stopCheckPayments = make(chan struct{})
 	checkPaymentWG    sync.WaitGroup
 	verifications     hub.Hub
@@ -134,6 +135,9 @@ func main() {
 
 	rateLimiter = limiter.New(memory.NewStore(), rate, limiter.WithTrustForwardHeader(true))
 	node = nano.New(config.NodeURL, config.NodeTimeout, config.NodeAuthorizationHeader)
+	if config.WorkNodeURL != "" {
+		worknode = nano.New(config.WorkNodeURL, config.NodeTimeout, config.NodeAuthorizationHeader)
+	}
 	notificationClient.Timeout = config.NotificationRequestTimeout
 	priceAPI = price.NewAPI(config.CoinmarketcapAPIKey, config.CoinmarketcapRequestTimeout, config.CoinmarketcapCacheDuration)
 

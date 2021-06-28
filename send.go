@@ -15,9 +15,20 @@ func sendAll(account, destination, privateKey string) error {
 	if info.Balance.IsZero() {
 		return nil
 	}
-	work, err := nano.GenerateWork(info.Frontier, true)
-	if err != nil {
-		return err
+	var work string
+	if worknode != nil {
+		work, err = worknode.RemoteWork(info.Frontier)
+		if err != nil {
+			work, err = nano.GenerateWork(info.Frontier, true)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		work, err = nano.GenerateWork(info.Frontier, true)
+		if err != nil {
+			return err
+		}
 	}
 	block, err := node.BlockCreate(info.Frontier, account, config.Representative, decimal.Zero, destination, privateKey, work)
 	if err != nil {
