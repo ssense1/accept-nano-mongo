@@ -154,7 +154,7 @@ func (p *Payment) SaveNew() error {
 		// This returns an error only if the Tx is closed or not writeable.
 		// That can't happen in an Update() call so I ignore the error check.
 
-		sortCursor, err := collection.Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"index": -1}).SetLimit(1))
+		sortCursor, err := collection.Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"index": -1}).SetCollation(&options.Collation{Locale: "en_US", NumericOrdering: true}).SetLimit(1))
 		if err != nil {
 			log.Fatal(err)
 			return err
@@ -171,7 +171,7 @@ func (p *Payment) SaveNew() error {
 		} else {
 			lastIndex = "0"
 		}
-		lastIndexInt, err := strconv.ParseInt(lastIndex, 10, 0)
+		lastIndexInt, err := strconv.ParseInt(lastIndex, 10, 64)
 
 		if err != nil {
 			log.Fatal(err)
